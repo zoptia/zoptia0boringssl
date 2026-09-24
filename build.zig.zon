@@ -1,0 +1,33 @@
+.{
+    .name = .zoptia0boringssl,
+    .version = "0.20260924.3",
+    .fingerprint = 0xb4a8af6c8ab1b423,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        // zoptia0boringssl additions
+        "build.zig",
+        "build.zig.zon",
+        "CLAUDE.md",
+        "zig",
+        // BoringSSL upstream tree (only what the library build needs; the
+        // C++ test suite additionally needs third_party/googletest and
+        // third_party/wycheproof_testvectors, which are only available in a
+        // git checkout, not in the fetched package)
+        "include",
+        "crypto",
+        "ssl",
+        "pki",
+        "gen",
+        "third_party/fiat",
+        // -Dfips=true builds these upstream Go host tools (delocate, inject_hash)
+        "go.mod",
+        "util/ar",
+        "util/fipstools/delocate",
+        "util/fipstools/inject_hash",
+        "util/fipstools/fipscommon",
+        // Upstream legal / attribution
+        "LICENSE",
+        "AUTHORS",
+    },
+}
