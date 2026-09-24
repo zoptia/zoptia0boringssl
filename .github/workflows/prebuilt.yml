@@ -1,0 +1,183 @@
+name: Prebuilt release
+
+# Builds prebuilt static libs for every supported target and uploads the
+# tarballs + SHA256SUMS as assets on the GitHub Release for the triggering
+# tag.
+#
+# Triggers:
+#   - push of a `v0.*` tag  — the normal path; the maintainer pushes a tag
+#     locally (after running `zig build test-all` to validate the sync) and
+#     this workflow ships the release.
+#   - workflow_dispatch     — back-fill an old tag, or rebuild after a
+#     prebuilt-only fix.
+
+on:
+  push:
+    tags: ['v0.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish prebuilt assets for (e.g. v0.20260514.0)'
+        required: true
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `run_tests: true` means the host can natively execute the produced
+          # binary, so prebuilt.yml will run BoringSSL's own ~3500 C++ tests
+          # (zig build test-all) in release mode before staging the tarball.
+          # If the test binary fails, the publish job is skipped — the GitHub
+          # Release won't get an asset that lost a test.
+
+          # Native runners.
+          - { os: ubuntu-latest,    label: linux-x86_64,         target: x86_64-linux-gnu,     extra: "",            archive_ext: a,   run_tests: true  }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,        target: aarch64-linux-gnu,    extra: "",            archive_ext: a,   run_tests: true  }
+          - { os: macos-latest,     label: macos-aarch64,        target: aarch64-macos,        extra: "",            archive_ext: a,   run_tests: true  }
+          # Windows x86_64 ships with asm ON: NASM assembles the perlasm .asm
+          # files. Upstream gates its fiat P-256 ADX SysV assembly on
+          # __ELF__ || __APPLE__, so the COFF build never references it.
+          - { os: windows-latest,   label: windows-x86_64-gnu,   target: x86_64-windows-gnu,   extra: "",            archive_ext: a,   run_tests: false, use_nasm: true  }
+          - { os: windows-latest,   label: windows-x86_64-msvc,  target: x86_64-windows-msvc,  extra: "",            archive_ext: lib, run_tests: false, use_nasm: true  }
+          # Cross-only — no native ARM Windows runner on GitHub yet (cross-
+          # build from Linux works because the .S files are GAS-format).
+          # MSVC ARM omitted — cross from Linux/macOS to -windows-msvc can't
+          # find the SDK.
+          - { os: ubuntu-latest,    label: windows-aarch64-gnu,  target: aarch64-windows-gnu,  extra: "",            archive_ext: a,   run_tests: false }
+          # Cross-only — wasm32-wasi (no wasi runtime on the runner by default).
+          - { os: ubuntu-latest,    label: wasm32-wasi,          target: wasm32-wasi,          extra: "-Dasm=false", archive_ext: a,   run_tests: false }
+          # musl static .a — works on Alpine, embedded Linux, and as an Android
+          # (Bionic) drop-in. The musl-static test binaries run fine on a
+          # glibc host (kernel ABI is the same), so we test them natively
+          # on whichever host arch matches the target.
+          - { os: ubuntu-latest,    label: linux-musl-x86_64,    target: x86_64-linux-musl,    extra: "",            archive_ext: a,   run_tests: true  }
+          - { os: ubuntu-24.04-arm, label: linux-musl-aarch64,   target: aarch64-linux-musl,   extra: "",            archive_ext: a,   run_tests: true  }
+    runs-on: ${{ matrix.os }}
+    steps:
+      # See ci.yml: keep the pki test vectors LF on Windows runners.
+      - name: Keep LF line endings (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          # Build the *tag* the user asked us to publish, not whatever
+          # main HEAD currently is. Without this, repeating a prebuilt
+          # run for an old tag silently builds today's code.
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Check build.zig.zon version matches the tag
+        # Zig names fetched packages "<name>-<version>-<hash>", so a stale
+        # .version makes two releases indistinguishable in consumers' caches.
+        shell: bash
+        run: |
+          ver="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",.*/\1/p' build.zig.zon)"
+          if [ "v$ver" != "$RELEASE_TAG" ]; then
+            echo "build.zig.zon .version is '$ver' but the tag is '$RELEASE_TAG'" >&2
+            echo "Bump .version before tagging (see zig/README.md, maintainer guide)." >&2
+            exit 1
+          fi
+          echo "ok: .version $ver matches $RELEASE_TAG"
+
+      - name: Install Zig via zvk (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/zoptia/zvk/main/install.sh | sh
+          echo "$HOME/.zvk/bin" >> "$GITHUB_PATH"
+
+      - name: Install Zig via zvk (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm https://raw.githubusercontent.com/zoptia/zvk/main/install.ps1 | iex
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.zvk\bin"
+
+      - name: Show toolchain
+        run: zig version
+
+      - name: Set up NASM (Windows x86_64)
+        if: matrix.use_nasm
+        uses: ilammy/setup-nasm@v1
+
+      - name: Build (release)
+        run: zig build -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Doptimize=ReleaseFast
+
+      - name: Run BoringSSL upstream test suite (release)
+        # Only when the host can natively execute the produced binary.
+        # Failure here skips the publish job — broken artifacts never
+        # land on a release.
+        if: matrix.run_tests
+        run: zig build -Dtarget=${{ matrix.target }} ${{ matrix.extra }} -Doptimize=ReleaseFast test-all
+
+      - name: Stage tarball contents
+        # Use git-bash on Windows so the same shell snippet works everywhere.
+        # `shasum` doesn't exist on Windows runners, so the SHA256 line is
+        # computed with python (always available) in the form
+        # `<hash>  <filename>` so it concatenates cleanly into SHA256SUMS.
+        shell: bash
+        run: |
+          set -euxo pipefail
+          STAGE="boringssl-${RELEASE_TAG}-${{ matrix.label }}"
+          mkdir -p "$STAGE/lib" "$STAGE/include"
+          cp zig-out/lib/* "$STAGE/lib/"
+          cp -R zig-out/include/openssl "$STAGE/include/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          python -c "import hashlib,sys; f=sys.argv[1]; h=hashlib.sha256(open(f,'rb').read()).hexdigest(); print(f'{h}  {f}')" \
+            "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          ls -l "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256"
+
+      - name: Upload artifact for collect job
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.label }}
+          path: |
+            boringssl-${{ env.RELEASE_TAG }}-${{ matrix.label }}.tar.gz
+            boringssl-${{ env.RELEASE_TAG }}-${{ matrix.label }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Build SHA256SUMS
+        run: |
+          set -euxo pipefail
+          cd assets
+          # Combine the per-tarball .sha256 files into one SHA256SUMS document.
+          # Each per-tarball file already has the form `<hash>  <filename>`.
+          cat *.tar.gz.sha256 | sort > SHA256SUMS
+          rm -f *.tar.gz.sha256
+          ls -lh
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          cd assets
+          # Create the release if the tag push path bypassed the UI; ignore if
+          # it already exists. Then attach all assets (clobber if rerun).
+          gh release create "${{ env.RELEASE_TAG }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.RELEASE_TAG }}" \
+            --notes "Prebuilt BoringSSL static libs for ${{ env.RELEASE_TAG }}. See zig/README.md for usage." \
+            --verify-tag \
+            || true
+          gh release upload "${{ env.RELEASE_TAG }}" *.tar.gz SHA256SUMS \
+            --repo "${{ github.repository }}" --clobber
